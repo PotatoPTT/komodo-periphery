@@ -1,0 +1,292 @@
+name: Build Komodo Periphery (Multi-Arch)
+
+on:
+  schedule:
+    - cron: '30 9 * * *'  # 06:30 BRT
+    - cron: '30 19 * * *' # 16:30 BRT
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Specific Komodo version (e.g. 2.3.4). Empty = latest release.'
+        required: false
+        default: ''
+        type: string
+      force:
+        description: 'Force rebuild even if tag already exists in GHCR'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: build-komodo-periphery
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build & Publish Multi-Arch Periphery
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve Komodo version & check GHCR
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/komodo-periphery"
+
+          LATEST_TAG=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/moghtech/komodo/releases/latest | jq -r '.tag_name')
+          LATEST_VERSION="${LATEST_TAG#v}"
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION="${LATEST_VERSION}"
+          fi
+
+          TAG="v${VERSION}"
+          MAJOR="${VERSION%%.*}"
+          MINOR="${VERSION%.*}"
+          IS_LATEST="false"
+          if [ "${VERSION}" = "${LATEST_VERSION}" ]; then
+            IS_LATEST="true"
+          fi
+
+          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "is_latest=${IS_LATEST}" >> "$GITHUB_OUTPUT"
+
+          echo "Target Komodo version: ${VERSION} (latest: ${LATEST_VERSION}, is_latest: ${IS_LATEST})"
+
+          UPSTREAM_RAW=$(docker buildx imagetools inspect --raw "ghcr.io/moghtech/komodo-periphery:${VERSION}" 2>/dev/null || true)
+          if [ -z "${UPSTREAM_RAW}" ]; then
+            echo "::notice::Official image ghcr.io/moghtech/komodo-periphery:${VERSION} is not yet available. Skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AMD64_DIGEST=$(echo "${UPSTREAM_RAW}" | jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")][0].digest // empty')
+          ARM64_DIGEST=$(echo "${UPSTREAM_RAW}" | jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64")][0].digest // empty')
+
+          if [ -z "${AMD64_DIGEST}" ] || [ -z "${ARM64_DIGEST}" ]; then
+            echo "::notice::Upstream amd64/arm64 manifests incomplete for ${VERSION}. Skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "amd64_digest=${AMD64_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "arm64_digest=${ARM64_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE_BUILD}" != "true" ]; then
+            EXISTING_RAW=$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" 2>/dev/null || true)
+            if [ -n "${EXISTING_RAW}" ] && echo "${EXISTING_RAW}" | jq -e '.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm" and .platform.variant=="v7")' >/dev/null 2>&1; then
+              echo "✅ ${IMAGE}:${VERSION} already published with linux/arm/v7. Nothing to do."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "🚀 Build required for ${IMAGE}:${VERSION}"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Clone moghtech/komodo & detect Rust toolchain
+        if: steps.meta.outputs.should_build == 'true'
+        id: source
+        env:
+          TARGET_TAG: ${{ steps.meta.outputs.tag }}
+          TARGET_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/komodo
+          git clone --depth 1 --branch "${TARGET_TAG}" https://github.com/moghtech/komodo.git /tmp/komodo
+
+          RUST_VERSION=$(grep -m1 '^FROM rust:' /tmp/komodo/bin/binaries.Dockerfile | sed -E 's/^FROM rust:([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/' || true)
+          if [ -z "${RUST_VERSION}" ]; then
+            RUST_IMAGE="rust:trixie"
+            RUST_KEY="trixie"
+          elif docker manifest inspect "rust:${RUST_VERSION}-trixie" >/dev/null 2>&1; then
+            RUST_IMAGE="rust:${RUST_VERSION}-trixie"
+            RUST_KEY="${RUST_VERSION}-trixie"
+          else
+            RUST_IMAGE="rust:trixie"
+            RUST_KEY="trixie"
+          fi
+          echo "Selected Rust builder image: ${RUST_IMAGE}"
+          echo "rust_image=${RUST_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "rust_key=${RUST_KEY}" >> "$GITHUB_OUTPUT"
+
+          # Stamp workspace version so periphery reports the exact Komodo version to Core
+          sed -i "0,/^version = \"0\.0\.0\"/s//version = \"${TARGET_VERSION}\"/" /tmp/komodo/Cargo.toml
+          grep -n '^version = ' /tmp/komodo/Cargo.toml | head -n 5
+
+          LOCK_HASH=$(sha256sum /tmp/komodo/Cargo.lock | awk '{print $1}')
+          echo "lock_hash=${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p /tmp/cargo-cache/registry /tmp/cargo-cache/git /tmp/komodo/target
+
+      - name: Cache Cargo dependencies
+        if: steps.meta.outputs.should_build == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            /tmp/cargo-cache/registry/index
+            /tmp/cargo-cache/registry/cache
+            /tmp/cargo-cache/git/db
+            /tmp/komodo/target
+          key: komodo-periphery-armv7-${{ steps.source.outputs.rust_key }}-${{ steps.source.outputs.lock_hash }}
+          restore-keys: |
+            komodo-periphery-armv7-${{ steps.source.outputs.rust_key }}-
+
+      - name: Cross-compile komodo_periphery for armv7 (Debian Trixie ABI)
+        if: steps.meta.outputs.should_build == 'true'
+        env:
+          RUST_IMAGE: ${{ steps.source.outputs.rust_image }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /tmp/komodo:/komodo \
+            -v /tmp/cargo-cache/registry:/usr/local/cargo/registry \
+            -v /tmp/cargo-cache/git:/usr/local/cargo/git \
+            -w /komodo \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+            -e CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+            -e CXX_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-g++ \
+            -e AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar \
+            -e PKG_CONFIG_ALLOW_CROSS_armv7_unknown_linux_gnueabihf=1 \
+            -e PKG_CONFIG_PATH_armv7_unknown_linux_gnueabihf=/usr/lib/arm-linux-gnueabihf/pkgconfig \
+            -e AWS_LC_SYS_CMAKE_BUILDER=1 \
+            -e BINDGEN_EXTRA_CLANG_ARGS="--target=armv7-unknown-linux-gnueabihf -I/usr/include/arm-linux-gnueabihf -I/usr/arm-linux-gnueabihf/include" \
+            "${RUST_IMAGE}" \
+            bash -ec '
+              set -euo pipefail
+              dpkg --add-architecture armhf
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                gcc-arm-linux-gnueabihf \
+                g++-arm-linux-gnueabihf \
+                libc6-dev-armhf-cross \
+                libssl-dev:armhf \
+                pkg-config \
+                cmake \
+                clang \
+                libclang-dev
+
+              rustup target add armv7-unknown-linux-gnueabihf
+              rustc --version
+
+              PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig pkg-config --modversion --cflags --libs openssl
+
+              cargo build -p komodo_periphery --release --target armv7-unknown-linux-gnueabihf
+              arm-linux-gnueabihf-strip target/armv7-unknown-linux-gnueabihf/release/periphery
+            '
+
+          sudo chown -R "$(id -u):$(id -g)" /tmp/komodo/target /tmp/cargo-cache
+
+          rm -rf /tmp/build-ctx
+          mkdir -p /tmp/build-ctx
+          cp /tmp/komodo/target/armv7-unknown-linux-gnueabihf/release/periphery /tmp/build-ctx/periphery
+          cp /tmp/komodo/bin/entrypoint.sh /tmp/build-ctx/entrypoint.sh
+          file /tmp/build-ctx/periphery
+          ls -lh /tmp/build-ctx/periphery
+
+      - name: Setup QEMU (arm)
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Setup Docker Buildx
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build linux/arm/v7 image for smoke test
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: /tmp/build-ctx
+          file: ${{ github.workspace }}/Dockerfile
+          platforms: linux/arm/v7
+          load: true
+          provenance: false
+          sbom: false
+          tags: komodo-periphery-armv7:test
+
+      - name: Smoke test linux/arm/v7 container
+        if: steps.meta.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm/v7 komodo-periphery-armv7:test periphery --help | head -n 10
+          docker run --rm --platform linux/arm/v7 --entrypoint /bin/bash komodo-periphery-armv7:test -c '
+            set -euo pipefail
+            uname -m
+            ldd /usr/local/bin/periphery
+            docker --version
+            docker compose version
+            git --version
+          '
+
+      - name: Push linux/arm/v7 image by digest
+        if: steps.meta.outputs.should_build == 'true'
+        id: push_armv7
+        uses: docker/build-push-action@v7
+        with:
+          context: /tmp/build-ctx
+          file: ${{ github.workspace }}/Dockerfile
+          platforms: linux/arm/v7
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Assemble & push multi-arch manifest (amd64 + arm64 + arm/v7)
+        if: steps.meta.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.image }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          MINOR="${{ steps.meta.outputs.minor }}"
+          MAJOR="${{ steps.meta.outputs.major }}"
+          IS_LATEST="${{ steps.meta.outputs.is_latest }}"
+
+          TAGS=(-t "${IMAGE}:${VERSION}")
+          if [ "${IS_LATEST}" = "true" ]; then
+            TAGS+=(-t "${IMAGE}:${MINOR}" -t "${IMAGE}:${MAJOR}" -t "${IMAGE}:latest")
+          fi
+
+          docker buildx imagetools create \
+            "${TAGS[@]}" \
+            "ghcr.io/moghtech/komodo-periphery@${{ steps.meta.outputs.amd64_digest }}" \
+            "ghcr.io/moghtech/komodo-periphery@${{ steps.meta.outputs.arm64_digest }}" \
+            "${IMAGE}@${{ steps.push_armv7.outputs.digest }}"
+
+          echo "=== Final Multi-Arch Manifest ==="
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
