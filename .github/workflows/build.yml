@@ -2,8 +2,7 @@ name: Build Komodo Periphery (Multi-Arch)
 
 on:
   schedule:
-    - cron: '30 9 * * *'  # 06:30 BRT
-    - cron: '30 19 * * *' # 16:30 BRT
+    - cron: '0 9 * * *'   # 06:00 BRT
   push:
     branches: [main]
     paths:
