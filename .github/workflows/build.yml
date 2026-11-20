@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -289,3 +289,37 @@ jobs:
 
           echo "=== Final Multi-Arch Manifest ==="
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      - name: Update VERSION or keep workflow active
+        if: success()
+        env:
+          SHOULD_BUILD: ${{ steps.meta.outputs.should_build }}
+          IS_LATEST: ${{ steps.meta.outputs.is_latest }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "${SHOULD_BUILD}" = "true" ] && [ "${IS_LATEST}" = "true" ]; then
+            CURRENT=$(cat VERSION 2>/dev/null || true)
+            if [ "${CURRENT}" != "${VERSION}" ]; then
+              printf '%s\n' "${VERSION}" > VERSION
+              git add VERSION
+              git commit -m "chore: update published version to ${VERSION}"
+              git pull --rebase origin main
+              git push origin HEAD:main
+              exit 0
+            fi
+          fi
+
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          NOW_TS=$(date +%s)
+          AGE_DAYS=$(( (NOW_TS - LAST_COMMIT_TS) / 86400 ))
+          echo "Days since last commit: ${AGE_DAYS}"
+
+          if [ "${AGE_DAYS}" -ge 45 ]; then
+            git commit --allow-empty -m "chore: keep scheduled workflow active"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
